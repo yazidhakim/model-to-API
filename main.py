@@ -1,15 +1,17 @@
 from __future__ import annotations
 from typing import List
 from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+import pandas as pd
 import numpy as np
 import joblib, json, os, sys
 
 app = FastAPI(title="Sleep Productivity Model", version="1.0.0")
 
-# === Paths aman (relatif ke file ini) ===
+# === Paths relatif aman ===
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH   = Path(os.getenv("MODEL_PATH")   or BASE_DIR / "models" / "rf_model.pkl")
 SCALER_PATH  = Path(os.getenv("SCALER_PATH")  or BASE_DIR / "models" / "scaler.pkl")
@@ -21,21 +23,21 @@ try:
     scaler = joblib.load(SCALER_PATH)
     with RAWFEAT_PATH.open("r", encoding="utf-8") as f:
         FEATURES: List[str] = json.load(f)
-    assert FEATURES == ["Sleep Duration", "Quality of Sleep", "Stress Level"], \
-        f"FEATURES tidak sesuai ekspektasi: {FEATURES}"
+
+    expected = ["Sleep Duration", "Quality of Sleep", "Stress Level"]
+    if FEATURES != expected:
+        raise ValueError(f"FEATURES tidak sesuai. Ditemukan={FEATURES} | Ekspektasi={expected}")
 except Exception as e:
     raise RuntimeError(
         f"Gagal load artefak: {e} | "
         f"MODEL_PATH={MODEL_PATH}, SCALER_PATH={SCALER_PATH}, RAWFEAT_PATH={RAWFEAT_PATH}"
     )
 
-# === CORS ===
+# === CORS (bebas diakses) ===
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 # === Schemas ===
@@ -54,13 +56,22 @@ class PredictBatchResponse(BaseModel):
     predictions: List[float]
 
 # === Helpers ===
-def row_from_input(d: InputData) -> np.ndarray:
+def row_from_input(d: InputData) -> pd.DataFrame:
+    """
+    Kembalikan DataFrame dg kolom persis seperti saat training → hilang warning sklearn.
+    """
     m = {
         "Sleep Duration":   d.sleep_duration,
         "Quality of Sleep": d.sleep_quality,
         "Stress Level":     d.stress_level,
     }
-    return np.array([[m[f] for f in FEATURES]], dtype=np.float32)
+    df = pd.DataFrame([[m[f] for f in FEATURES]], columns=FEATURES).astype("float32")
+    return df
+
+def df_from_batch(rows: List[InputData]) -> pd.DataFrame:
+    data = [[r.sleep_duration, r.sleep_quality, r.stress_level] for r in rows]
+    df = pd.DataFrame(data, columns=FEATURES).astype("float32")
+    return df
 
 # === Endpoints ===
 @app.get("/")
@@ -81,9 +92,9 @@ def health():
 @app.post("/predict", response_model=PredictResponse)
 def predict(data: InputData):
     try:
-        X = row_from_input(data)
-        Xs = scaler.transform(X)
-        y = float(model.predict(Xs)[0])
+        X_df = row_from_input(data)
+        Xs   = scaler.transform(X_df)
+        y    = float(model.predict(Xs)[0])
         return PredictResponse(prediction=y)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Predict error: {e}")
@@ -93,9 +104,9 @@ def predict_batch(req: BatchRequest):
     try:
         if not req.rows:
             return PredictBatchResponse(predictions=[])
-        X = np.vstack([row_from_input(r) for r in req.rows])
-        Xs = scaler.transform(X)
-        ys = model.predict(Xs).astype(float).tolist()
+        X_df = df_from_batch(req.rows)
+        Xs   = scaler.transform(X_df)
+        ys   = model.predict(Xs).astype(float).tolist()
         return PredictBatchResponse(predictions=ys)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Predict error: {e}")
